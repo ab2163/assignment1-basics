@@ -161,3 +161,12 @@ cython_debug/
 
 .ruff_cache/
 *.zip
+
+data/
+venv/
+wandb/
+checkpoints/
+__pycache__/
+.DS_Store
+train_command.txt
+cs336_basics/*.json
