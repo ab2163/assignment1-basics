@@ -1,11 +1,13 @@
 import torch
 import torch.nn as nn
 import math
+import torch.cuda.nvtx as nvtx
 from einops import einsum
 from einops import reduce
 from einops import rearrange
 from jaxtyping import Float, Int, Bool
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
 class Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, device=None, dtype=None):
@@ -102,27 +104,25 @@ def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
     exp_x = torch.exp(x)
     return exp_x / exp_x.sum(dim=dim, keepdim=True)
 
-def scaled_dot_product_attention(
-    Q: Float[Tensor, "... seq_len d_k"],
-    K: Float[Tensor, "... seq_len d_k"],
-    V: Float[Tensor, "... seq_len d_v"],
-    mask: Bool[Tensor, "seq_len seq_len"] | None = None,
-) -> Float[Tensor, "... seq_len d_v"]:
-
+def scaled_dot_product_attention(Q, K, V, mask=None):
     d_k = Q.shape[-1]
 
-    # compute attention scores: (..., seq_len, seq_len)
+    nvtx.range_push("attn_scores_matmul")
     scores = einsum(Q, K, "... seq_q d_k, ... seq_k d_k -> ... seq_q seq_k") / (d_k ** 0.5)
+    nvtx.range_pop()
 
-    # apply mask: set False positions to -inf
     if mask is not None:
         scores = scores.masked_fill(~mask, float("-inf"))
 
-    # softmax over key dimension
+    nvtx.range_push("attn_softmax")
     attn_weights = softmax(scores, dim=-1)
+    nvtx.range_pop()
 
-    # weighted sum of values: (..., seq_len, d_v)
-    return einsum(attn_weights, V, "... seq_q seq_k, ... seq_k d_v -> ... seq_q d_v")
+    nvtx.range_push("attn_values_matmul")
+    result = einsum(attn_weights, V, "... seq_q seq_k, ... seq_k d_v -> ... seq_q d_v")
+    nvtx.range_pop()
+
+    return result
 
 class CausalMultiHeadSelfAttention(nn.Module):
     def __init__(self, d_model: int, num_heads: int, max_seq_len: int, theta: float, use_rope: bool = True, device=None, dtype=None):
@@ -229,24 +229,48 @@ class TransformerBlock(nn.Module):
             seq_len = x.shape[-2]
             token_positions = torch.arange(seq_len, device=x.device)
 
-        # first sub-layer: attention
-        if self.use_norm and self.pre_norm:
-            # pre-norm: norm -> attn -> residual
-            x = x + self.attn(self.attn_norm(x), token_positions)
-        elif self.use_norm and not self.pre_norm:
-            # post-norm: attn -> residual -> norm
-            x = self.attn_norm(x + self.attn(x, token_positions))
-        else:
-            # no norm
-            x = x + self.attn(x, token_positions)
+        with nvtx.range("transformer_block"):
+            # first sub-layer: attention
+            with nvtx.range("attn_sublayer"):
+                if self.use_norm and self.pre_norm:
+                    # pre-norm: norm -> attn -> residual
+                    with nvtx.range("attn_norm"):
+                        normed = self.attn_norm(x)
+                    with nvtx.range("attn"):
+                        attn_out = self.attn(normed, token_positions)
+                    x = x + attn_out
+                elif self.use_norm and not self.pre_norm:
+                    # post-norm: attn -> residual -> norm
+                    with nvtx.range("attn"):
+                        attn_out = self.attn(x, token_positions)
+                    with nvtx.range("attn_residual"):
+                        residual = x + attn_out
+                    with nvtx.range("attn_norm"):
+                        x = self.attn_norm(residual)
+                else:
+                    # no norm
+                    with nvtx.range("attn"):
+                        x = x + self.attn(x, token_positions)
 
-        # second sub-layer: feedforward
-        if self.use_norm and self.pre_norm:
-            x = x + self.ff(self.ff_norm(x))
-        elif self.use_norm and not self.pre_norm:
-            x = self.ff_norm(x + self.ff(x))
-        else:
-            x = x + self.ff(x)
+            # second sub-layer: feedforward
+            with nvtx.range("ffn_sublayer"):
+                if self.use_norm and self.pre_norm:
+                    with nvtx.range("ffn_norm"):
+                        normed = self.ff_norm(x)
+                    with nvtx.range("ffn"):
+                        ffn_out = self.ff(normed)
+                    x = x + ffn_out
+                elif self.use_norm and not self.pre_norm:
+                    # post-norm: ffn -> residual -> norm
+                    with nvtx.range("ffn"):
+                        ffn_out = self.ff(x)
+                    with nvtx.range("ffn_residual"):
+                        residual = x + ffn_out
+                    with nvtx.range("ffn_norm"):
+                        x = self.ff_norm(residual)
+                else:
+                    with nvtx.range("ffn"):
+                        x = x + self.ff(x)
 
         return x
     
@@ -266,8 +290,12 @@ class TransformerLM(nn.Module):
         pre_norm: bool = True,
         use_rope = True,
         use_swiglu = True,
+        use_checkpoint: bool = False,
+        checkpoint_blocks: int = 1,
     ):
         super().__init__()
+        self.use_checkpoint = use_checkpoint
+        self.checkpoint_blocks = checkpoint_blocks
         self.embedding = Embedding(vocab_size, d_model, device=device, dtype=dtype)
         self.layers = nn.ModuleList([
             TransformerBlock(d_model, num_heads, d_ff, context_length, theta, use_norm=use_norm,
@@ -290,10 +318,28 @@ class TransformerLM(nn.Module):
 
         # embed tokens
         x = self.embedding(token_ids)
-
+            
         # pass through transformer blocks
-        for layer in self.layers:
-            x = layer(x, token_positions)
+        if self.use_checkpoint and self.checkpoint_blocks > 1:
+            # checkpoint every k blocks
+            def run_k_blocks(x, start_idx):
+                for i in range(start_idx, min(start_idx + self.checkpoint_blocks, len(self.layers))):
+                    x = self.layers[i](x, token_positions)
+                return x
+
+            for start in range(0, len(self.layers), self.checkpoint_blocks):
+                x = checkpoint(
+                    run_k_blocks, x, start,
+                    use_reentrant=False
+                )
+        elif self.use_checkpoint:
+            # checkpoint every block
+            for layer in self.layers:
+                x = checkpoint(layer, x, token_positions, use_reentrant=False)
+        else:
+            # no checkpointing
+            for layer in self.layers:
+                x = layer(x, token_positions)
 
         # final norm and LM head
         x = self.final_norm(x)
