@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import math
 import torch.cuda.nvtx as nvtx
+import triton
+import triton.language as tl
 from einops import einsum
 from einops import reduce
 from einops import rearrange
@@ -440,3 +442,286 @@ def gradient_clipping(parameters, max_norm: float, eps: float = 1e-6) -> None:
         scale = max_norm / (global_norm + eps)
         for g in grads:
             g.mul_(scale)
+
+import torch
+import torch.nn.functional as F
+from einops import rearrange
+import math
+
+class FlashAttentionPyTorch(torch.autograd.Function):
+    
+    @staticmethod
+    def forward(ctx, Q, K, V, is_causal=False):
+        """
+        FlashAttention-2 forward pass in pure PyTorch.
+        
+        Args:
+            Q: (batch, seq_len, d_k)
+            K: (batch, seq_len, d_k)
+            V: (batch, seq_len, d_v)
+            is_causal: bool (ignored for now)
+        
+        Returns:
+            O: (batch, seq_len, d_v)
+        """
+        batch, seq_len, d_k = Q.shape
+        d_v = V.shape[-1]
+        scale = 1.0 / math.sqrt(d_k)
+
+        # tile sizes — at least 16x16
+        BLOCK_SIZE = max(16, min(64, seq_len))
+
+        # output and logsumexp
+        O = torch.zeros(batch, seq_len, d_v, device=Q.device, dtype=Q.dtype)
+        L = torch.full((batch, seq_len), float('-inf'), device=Q.device, dtype=torch.float32)
+
+        # number of tiles
+        num_tiles = seq_len // BLOCK_SIZE
+
+        for i in range(num_tiles):
+            # query tile indices
+            q_start = i * BLOCK_SIZE
+            q_end   = q_start + BLOCK_SIZE
+
+            # load query tile
+            Q_i = Q[:, q_start:q_end, :]  # (batch, BLOCK_SIZE, d_k)
+
+            # running statistics for this query tile
+            # running maximums (for each BLOCK_SIZE the inner loop goes over)
+            m_i = torch.full((batch, BLOCK_SIZE), float('-inf'), 
+                           device=Q.device, dtype=torch.float32)
+            # running sums (for each BLOCK_SIZE the inner loop goes over)
+            d_i = torch.zeros(batch, BLOCK_SIZE, 
+                            device=Q.device, dtype=torch.float32)
+            # "accumulator" (i.e. the slice of the output matrix you are computing)
+            O_i = torch.zeros(batch, BLOCK_SIZE, d_v, 
+                            device=Q.device, dtype=Q.dtype)
+
+            for j in range(num_tiles):
+                # key/value tile indices
+                kv_start = j * BLOCK_SIZE
+                kv_end   = kv_start + BLOCK_SIZE
+
+                # load key/value tiles
+                K_j = K[:, kv_start:kv_end, :]  # (batch, BLOCK_SIZE, d_k)
+                V_j = V[:, kv_start:kv_end, :]  # (batch, BLOCK_SIZE, d_v)
+
+                # compute attention scores for this tile
+                # S_ij: (batch, BLOCK_SIZE_q, BLOCK_SIZE_kv)
+                S_ij = torch.einsum('bid,bjd->bij', Q_i, K_j) * scale
+
+                # local max for numerical stability
+                m_ij = S_ij.max(dim=-1).values  # (batch, BLOCK_SIZE_q)
+
+                # update running max
+                # note this is elementwise
+                m_i_new = torch.maximum(m_i, m_ij)  # (batch, BLOCK_SIZE_q)
+
+                # compute exponentials with stability correction
+                P_ij = torch.exp(S_ij - m_i_new.unsqueeze(-1))  # (batch, BLOCK_SIZE_q, BLOCK_SIZE_kv)
+
+                # correction factor for previous running sum
+                correction = torch.exp(m_i - m_i_new)  # (batch, BLOCK_SIZE_q)
+
+                # update running sum
+                d_i = correction * d_i + P_ij.sum(dim=-1)  # (batch, BLOCK_SIZE_q)
+
+                # update output accumulator
+                # note "correction" is NOT doing normalisation (this happens after inner loop)
+                # it is simply correcting the effect of the old values of m_i
+                O_i = (correction.unsqueeze(-1) * O_i.float() + 
+                       torch.einsum('bij,bjd->bid', P_ij.float(), V_j.float()))
+
+                # update running max
+                m_i = m_i_new
+
+            # normalise output for this query tile
+            O_i = O_i / d_i.unsqueeze(-1)
+            O[:, q_start:q_end, :] = O_i.to(Q.dtype)
+
+            # compute logsumexp: L = m + log(d)
+            L[:, q_start:q_end] = m_i + torch.log(d_i)
+
+        # save for backward
+        ctx.save_for_backward(L, Q, K, V, O)
+        ctx.is_causal = is_causal
+
+        return O
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        raise NotImplementedError("FlashAttention backward not implemented yet")
+
+def flash_attention_pytorch(Q, K, V, is_causal=False):
+    return FlashAttentionPyTorch.apply(Q, K, V, is_causal)
+
+@triton.jit
+def flash_fwd_kernel(
+    Q_ptr, K_ptr, V_ptr,
+    O_ptr, L_ptr,
+    stride_qb, stride_qq, stride_qd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_ob, stride_oq, stride_od,
+    stride_lb, stride_lq,
+    N_QUERIES, N_KEYS,
+    scale,
+    D: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,  # <-- new constexpr flag
+):
+    query_tile_index = tl.program_id(0)
+    batch_index = tl.program_id(1)
+
+    # query indices for this tile
+    query_start = query_tile_index * Q_TILE_SIZE
+    query_indices = query_start + tl.arange(0, Q_TILE_SIZE)  # (Q_TILE_SIZE,)
+
+    Q_block_ptr = tl.make_block_ptr(
+        Q_ptr + batch_index * stride_qb,
+        shape=(N_QUERIES, D),
+        strides=(stride_qq, stride_qd),
+        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + batch_index * stride_kb,
+        shape=(N_KEYS, D),
+        strides=(stride_kk, stride_kd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + batch_index * stride_vb,
+        shape=(N_KEYS, D),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    O_block_ptr = tl.make_block_ptr(
+        O_ptr + batch_index * stride_ob,
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_index * stride_lb,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(query_tile_index * Q_TILE_SIZE,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )
+
+    Q = tl.load(Q_block_ptr)
+
+    O_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
+    m_i = tl.full((Q_TILE_SIZE,), float('-inf'), dtype=tl.float32)
+    d_i = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
+
+    n_key_tiles = tl.cdiv(N_KEYS, K_TILE_SIZE)
+
+    for j in range(n_key_tiles):
+        # key indices for this tile
+        key_start = j * K_TILE_SIZE
+        key_indices = key_start + tl.arange(0, K_TILE_SIZE)  # (K_TILE_SIZE,)
+
+        K = tl.load(K_block_ptr)
+        V = tl.load(V_block_ptr)
+
+        S_ij = tl.dot(Q, tl.trans(K)) * scale  # (Q_TILE_SIZE, K_TILE_SIZE)
+
+        # apply causal mask
+        if IS_CAUSAL:
+            # mask[i, j] = True if query_i can attend to key_j (j <= i)
+            causal_mask = query_indices[:, None] >= key_indices[None, :]  # (Q_TILE_SIZE, K_TILE_SIZE)
+            S_ij = tl.where(causal_mask, S_ij, float('-inf'))
+
+        m_ij = tl.max(S_ij, axis=1)
+        m_i_new = tl.maximum(m_i, m_ij)
+        correction = tl.exp(m_i - m_i_new)
+        P_ij = tl.exp(S_ij - m_i_new[:, None])
+        d_i = correction * d_i + tl.sum(P_ij, axis=1)
+        O_i = correction[:, None] * O_i
+        O_i = tl.dot(P_ij.to(V_block_ptr.type.element_ty), V, acc=O_i)
+        m_i = m_i_new
+
+        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+
+    O_i = O_i / d_i[:, None]
+    L_i = m_i + tl.log(d_i)
+
+    tl.store(O_block_ptr, O_i.to(O_block_ptr.type.element_ty))
+    tl.store(L_block_ptr, L_i)
+
+class FlashAttentionTriton(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, Q, K, V, is_causal=False):
+        """
+        FlashAttention-2 forward pass using Triton kernel.
+
+        Args:
+            Q: (batch, seq_len, d_k)
+            K: (batch, seq_len, d_k)
+            V: (batch, seq_len, d_v)
+            is_causal: bool (ignored for now)
+
+        Returns:
+            O: (batch, seq_len, d_v)
+        """
+        batch, N_QUERIES, D = Q.shape
+        N_KEYS = K.shape[1]
+        scale = 1.0 / math.sqrt(D)
+
+        # tile sizes — powers of 2, at least 16
+        Q_TILE_SIZE = max(16, triton.next_power_of_2(min(N_QUERIES, 64)))
+        K_TILE_SIZE = max(16, triton.next_power_of_2(min(N_KEYS, 64)))
+
+        # ensure contiguous
+        Q = Q.contiguous()
+        K = K.contiguous()
+        V = V.contiguous()
+
+        # allocate output tensors
+        O = torch.empty(batch, N_QUERIES, D, device=Q.device, dtype=Q.dtype)
+        L = torch.empty(batch, N_QUERIES, device=Q.device, dtype=torch.float32)
+
+        # launch grid: (num_query_tiles, batch_size)
+        grid = (triton.cdiv(N_QUERIES, Q_TILE_SIZE), batch)
+
+        flash_fwd_kernel[grid](
+            Q, K, V,
+            O, L,
+            Q.stride(0), Q.stride(1), Q.stride(2),
+            K.stride(0), K.stride(1), K.stride(2),
+            V.stride(0), V.stride(1), V.stride(2),
+            O.stride(0), O.stride(1), O.stride(2),
+            L.stride(0), L.stride(1),
+            N_QUERIES, N_KEYS,
+            scale,
+            D=D,
+            Q_TILE_SIZE=Q_TILE_SIZE,
+            K_TILE_SIZE=K_TILE_SIZE,
+            IS_CAUSAL=is_causal,  # <-- pass flag
+        )
+
+        # save for backward
+        ctx.save_for_backward(L, Q, K, V, O)
+        ctx.is_causal = is_causal
+
+        return O
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        raise NotImplementedError("FlashAttention Triton backward not implemented yet")
+
+def get_flash_autograd_function_triton():
+    return FlashAttentionTriton
