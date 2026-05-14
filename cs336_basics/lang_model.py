@@ -543,14 +543,19 @@ class FlashAttentionPyTorch(torch.autograd.Function):
             L[:, q_start:q_end] = m_i + torch.log(d_i)
 
         # save for backward
-        ctx.save_for_backward(L, Q, K, V, O)
+        ctx.save_for_backward(Q, K, V, O, L)
         ctx.is_causal = is_causal
 
         return O
 
     @staticmethod
     def backward(ctx, grad_output):
-        raise NotImplementedError("FlashAttention backward not implemented yet")
+        Q, K, V, O, L = ctx.saved_tensors  # note: save these in forward!
+        is_causal = ctx.is_causal
+        dQ, dK, dV = flash_attention_backward_compiled(
+            Q, K, V, O, grad_output.contiguous(), L, is_causal
+        )
+        return dQ, dK, dV, None
 
 def flash_attention_pytorch(Q, K, V, is_causal=False):
     return FlashAttentionPyTorch.apply(Q, K, V, is_causal)
@@ -720,8 +725,71 @@ class FlashAttentionTriton(torch.autograd.Function):
         return O
 
     @staticmethod
-    def backward(ctx, grad_output):
-        raise NotImplementedError("FlashAttention Triton backward not implemented yet")
+    def backward(ctx, dO):
+        L, Q, K, V, O = ctx.saved_tensors  # match forward save order: L, Q, K, V, O
+        is_causal = ctx.is_causal
+
+        # use compiled pytorch backward
+        dQ, dK, dV = flash_attention_backward_compiled(
+            Q, K, V, O, dO.contiguous(), L, is_causal
+        )
+
+        # return gradients for each forward input
+        # is_causal has no gradient (not a tensor)
+        return dQ, dK, dV, None
 
 def get_flash_autograd_function_triton():
     return FlashAttentionTriton
+
+def flash_attention_backward_pytorch(Q, K, V, O, dO, L, is_causal=False):
+    orig_dtype = Q.dtype
+    # work entirely in float32 for numerical stability
+    Q  = Q.float()
+    K  = K.float()
+    V  = V.float()
+    O  = O.float()
+    dO = dO.float()
+    # L is already float32
+
+    # handle arbitrary batch/head dimensions using ...
+    scale = 1.0 / math.sqrt(Q.shape[-1])
+    seq_len = Q.shape[-2]
+
+    # D vector: (..., seq_len)
+    D = (O * dO).sum(dim=-1)
+
+    # recompute scores: (..., seq_q, seq_k)
+    S = torch.einsum('...id,...jd->...ij', Q, K) * scale
+
+    if is_causal:
+        mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=Q.device), diagonal=1
+        ).bool()
+        S = S.masked_fill(mask, float('-inf'))
+
+    # recompute P from saved L
+    P = torch.exp(S - L.unsqueeze(-1))
+
+    # dV: (..., seq_k, d_v)
+    dV = torch.einsum('...ij,...id->...jd', P, dO)
+
+    # dP: (..., seq_q, seq_k)
+    dP = torch.einsum('...id,...jd->...ij', dO, V)
+
+    # dS: (..., seq_q, seq_k)
+    dS = P * (dP - D.unsqueeze(-1))
+
+    if is_causal:
+        dS = dS.masked_fill(mask, 0.0)
+
+    # dQ: (..., seq_q, d_k)
+    dQ = torch.einsum('...ij,...jd->...id', dS, K) * scale
+
+    # dK: (..., seq_k, d_k)
+    dK = torch.einsum('...ij,...id->...jd', dS, Q) * scale
+
+    # cast back to original dtype
+    return dQ.to(orig_dtype), dK.to(orig_dtype), dV.to(orig_dtype)
+
+# compile for performance
+flash_attention_backward_compiled = torch.compile(flash_attention_backward_pytorch)
